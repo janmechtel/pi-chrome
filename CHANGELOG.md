@@ -2,6 +2,12 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.50
+
+- **Per-profile client ids.** Unpacked installs share `chrome.runtime.id` across profiles; each profile now stores its own id in `chrome.storage.local` so multiple profiles show up.
+- **Readable labels.** Prefer signed-in email (`identity.email`), enriched with Chrome profile name from Local State when available.
+- **/chrome authorize** no longer asks the indefinite yes/no confirm.
+
 ## 0.15.49
 
 - **Authorize works when another Pi owns the bridge.** Client-mode sessions discover connected profiles via the owner's `/status` (including legacy single-client owners).

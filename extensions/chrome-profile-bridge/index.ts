@@ -238,6 +238,44 @@ function browserExtensionPath(): string {
 	return join(extensionRoot(), "browser-extension");
 }
 
+function chromeProfileDirectoryHints(): Array<{ dir: string; name: string; email: string }> {
+	const home = process.env.HOME || process.env.USERPROFILE || "";
+	if (!home) return [];
+	const candidates = [
+		join(home, ".config", "google-chrome", "Local State"),
+		join(home, ".config", "chromium", "Local State"),
+		join(home, "Library", "Application Support", "Google", "Chrome", "Local State"),
+		join(home, "AppData", "Local", "Google", "Chrome", "User Data", "Local State"),
+	];
+	for (const path of candidates) {
+		try {
+			if (!existsSync(path)) continue;
+			const data = JSON.parse(readFileSync(path, "utf8")) as {
+				profile?: { info_cache?: Record<string, { name?: string; user_name?: string; gaia_name?: string }> };
+			};
+			const cache = data.profile?.info_cache ?? {};
+			return Object.entries(cache).map(([dir, info]) => ({
+				dir,
+				name: String(info?.name || dir),
+				email: String(info?.user_name || info?.gaia_name || "").toLowerCase(),
+			}));
+		} catch {
+			// try next path
+		}
+	}
+	return [];
+}
+
+function enrichProfileLabel(label: string): string {
+	const hints = chromeProfileDirectoryHints();
+	const lower = label.toLowerCase();
+	const byEmail = hints.find((h) => h.email && h.email === lower);
+	if (byEmail) return `${byEmail.name} <${byEmail.email}>`;
+	const byName = hints.find((h) => h.name.toLowerCase() === lower);
+	if (byName && byName.email) return `${byName.name} <${byName.email}>`;
+	return label;
+}
+
 function hostnameOf(url: string | undefined): string {
 	if (!url) return "";
 	try { return new URL(url).hostname; } catch { return ""; }
@@ -1107,7 +1145,7 @@ Usage rules:
 					lines.push("  Note: this Pi session is sharing another session's bridge. /reload or quit that other Pi session so this fork can own :17318.");
 				}
 			} else {
-				lines.push(`✓ Connected profiles (${clients.length}): ${clients.map((c) => c.profileLabel).join(", ")}`);
+				lines.push(`✓ Connected profiles (${clients.length}): ${clients.map((c) => enrichProfileLabel(c.profileLabel)).join(", ")}`);
 				if (selectedProfileLabel) lines.push(`• Authorized profile: ${selectedProfileLabel}`);
 			}
 			let extensionAlive = false;
@@ -1125,19 +1163,19 @@ Usage rules:
 					if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
 						versionMismatch = true;
 						lines.push(
-							`✗ Profile "${client.profileLabel}" extension v${version.extensionVersion} (pi-chrome ${PI_CHROME_VERSION}). Reload it at chrome://extensions.`,
+							`✗ Profile "${enrichProfileLabel(client.profileLabel)}" extension v${version.extensionVersion} (pi-chrome ${PI_CHROME_VERSION}). Reload it at chrome://extensions.`,
 						);
 					} else {
-						lines.push(`✓ Profile "${client.profileLabel}" ok (${latencyMs}ms).`);
+						lines.push(`✓ Profile "${enrichProfileLabel(client.profileLabel)}" ok (${latencyMs}ms).`);
 					}
 				} catch (error) {
-					lines.push(`✗ Profile "${client.profileLabel}" not responding: ${(error as Error).message}`);
+					lines.push(`✗ Profile "${enrichProfileLabel(client.profileLabel)}" not responding: ${(error as Error).message}`);
 				}
 			}
 
 			if (extensionAlive && !versionMismatch && clients.length > 0) {
 				const probeClientId = selectedClientId ?? clients[0].clientId;
-				const probeLabel = selectedProfileLabel ?? clients[0].profileLabel;
+				const probeLabel = selectedProfileLabel ?? enrichProfileLabel(clients[0].profileLabel);
 				try {
 					const value = await bridge.send(
 						"page.evaluate",
@@ -1200,14 +1238,6 @@ Usage rules:
 	};
 
 	const authorizeFor = async (ctx: ExtensionContext, clientId: string, profileLabel: string) => {
-		const ok = await ctx.ui.confirm(
-			"Authorize pi-chrome control?",
-			`This Pi session will control Chrome profile "${profileLabel}" indefinitely (until /chrome revoke or Pi exits).\n\nChrome actions use that profile's signed-in state and real input. Only approve if you trust the current agent/task.`,
-		);
-		if (!ok) {
-			ctx.ui.notify("Chrome control remains locked.", "info");
-			return;
-		}
 		const wasUsable = chromeToolsUsable;
 		selectedClientId = clientId;
 		selectedProfileLabel = profileLabel;
@@ -1243,23 +1273,27 @@ Usage rules:
 		}
 		if (preferred) {
 			const pref = preferred.trim().toLowerCase();
-			const hit = clients.find(
-				(c) =>
+			const hit = clients.find((c) => {
+				const enriched = enrichProfileLabel(c.profileLabel).toLowerCase();
+				return (
 					c.profileLabel.toLowerCase() === pref ||
+					enriched === pref ||
 					c.clientId.toLowerCase() === pref ||
-					c.profileLabel.toLowerCase().includes(pref),
-			);
-			if (hit) return { clientId: hit.clientId, profileLabel: hit.profileLabel };
-			ctx.ui.notify(`No connected profile matches '${preferred}'. Connected: ${clients.map((c) => c.profileLabel).join(", ")}`, "warning");
+					c.profileLabel.toLowerCase().includes(pref) ||
+					enriched.includes(pref)
+				);
+			});
+			if (hit) return { clientId: hit.clientId, profileLabel: enrichProfileLabel(hit.profileLabel) };
+			ctx.ui.notify(`No connected profile matches '${preferred}'. Connected: ${clients.map((c) => enrichProfileLabel(c.profileLabel)).join(", ")}`, "warning");
 			return undefined;
 		}
-		const labels = clients.map((c) => c.profileLabel);
-		const choice = await ctx.ui.select("Authorize which Chrome profile? (indefinite)", labels);
+		const labels = clients.map((c) => enrichProfileLabel(c.profileLabel));
+		const choice = await ctx.ui.select("Authorize which Chrome profile?", labels);
 		if (!choice) return undefined;
-		const idx = labels.indexOf(choice);
-		const picked = idx >= 0 ? clients[idx] : undefined;
+		const pickIndex = labels.indexOf(choice);
+		const picked = pickIndex >= 0 ? clients[pickIndex] : undefined;
 		if (!picked) return undefined;
-		return { clientId: picked.clientId, profileLabel: picked.profileLabel };
+		return { clientId: picked.clientId, profileLabel: labels[pickIndex] };
 	};
 
 	const authorizeHandler = async (ctx: ExtensionContext, args: string) => {
@@ -1306,7 +1340,7 @@ Usage rules:
 		if (clients.length === 0) {
 			parts.push(`✗ no Chrome profile connected`);
 		} else {
-			parts.push(`✓ ${clients.length} profile${clients.length === 1 ? "" : "s"}: ${clients.map((c) => c.profileLabel).join(", ")}`);
+			parts.push(`✓ ${clients.length} profile${clients.length === 1 ? "" : "s"}: ${clients.map((c) => enrichProfileLabel(c.profileLabel)).join(", ")}`);
 		}
 		parts.push(`auth: ${authSummary()}`);
 		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);

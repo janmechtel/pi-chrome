@@ -1,24 +1,58 @@
 const BRIDGE_URL = "http://127.0.0.1:17318";
-const CLIENT_ID = chrome.runtime.id;
-const CLIENT_NAME = `Pi Chrome Connector ${CLIENT_ID}`;
-let profileLabel = CLIENT_ID.slice(0, 8);
+const EXTENSION_ID = chrome.runtime.id;
+// Unpacked extensions loaded from the same path share chrome.runtime.id across Chrome profiles.
+// Persist a per-profile instance id in chrome.storage.local (isolated per profile).
+const CLIENT_ID_KEY = "piChromeClientId";
+const PROFILE_LABEL_KEY = "profileLabel";
+let clientId = null;
+let profileLabel = "Chrome profile";
+let identityReady = initIdentity();
+
+function randomId() {
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+  return `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function ensureClientId() {
+  if (clientId) return clientId;
+  try {
+    const stored = await chrome.storage.local.get(CLIENT_ID_KEY);
+    if (typeof stored[CLIENT_ID_KEY] === "string" && stored[CLIENT_ID_KEY]) {
+      clientId = stored[CLIENT_ID_KEY];
+      return clientId;
+    }
+  } catch {}
+  clientId = randomId();
+  try { await chrome.storage.local.set({ [CLIENT_ID_KEY]: clientId }); } catch {}
+  return clientId;
+}
 
 async function refreshProfileLabel() {
-  // Best-effort human label: active Google account email, else short extension id.
+  // Prefer signed-in email (needs identity + identity.email), then stored label, then short id.
   try {
     if (chrome.identity?.getProfileUserInfo) {
       const info = await chrome.identity.getProfileUserInfo({ accountStatus: "ANY" });
-      if (info?.email) { profileLabel = info.email; return; }
+      if (info?.email) {
+        profileLabel = info.email;
+        try { await chrome.storage.local.set({ [PROFILE_LABEL_KEY]: profileLabel }); } catch {}
+        return;
+      }
     }
   } catch {}
   try {
-    const stored = await chrome.storage.local.get("profileLabel");
-    if (typeof stored.profileLabel === "string" && stored.profileLabel.trim()) {
-      profileLabel = stored.profileLabel.trim();
+    const stored = await chrome.storage.local.get(PROFILE_LABEL_KEY);
+    if (typeof stored[PROFILE_LABEL_KEY] === "string" && stored[PROFILE_LABEL_KEY].trim()) {
+      profileLabel = stored[PROFILE_LABEL_KEY].trim();
       return;
     }
   } catch {}
-  profileLabel = CLIENT_ID.slice(0, 8);
+  const id = await ensureClientId();
+  profileLabel = `Chrome profile (${id.slice(0, 8)})`;
+}
+
+async function initIdentity() {
+  await ensureClientId();
+  await refreshProfileLabel();
 }
 
 const POLL_ERROR_BACKOFF_MS = 2000;
@@ -997,7 +1031,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.action.setBadgeText({ text: "pi" });
   chrome.action.setBadgeBackgroundColor({ color: "#4f46e5" });
   armKeepaliveAlarm();
-  void refreshProfileLabel();
+  void identityReady;
   void pollLoop();
 });
 
@@ -1025,12 +1059,15 @@ async function pollLoop() {
   if (polling) return;
   polling = true;
   try {
+    await identityReady;
     await refreshProfileLabel();
     while (true) {
+      const id = await ensureClientId();
       const qs = new URLSearchParams({
-        name: CLIENT_NAME,
-        clientId: CLIENT_ID,
+        name: `Pi Chrome Connector ${id}`,
+        clientId: id,
         profileLabel,
+        extensionId: EXTENSION_ID,
       });
       const response = await fetch(`${BRIDGE_URL}/next?${qs}`, {
         cache: "no-store",
@@ -1151,9 +1188,11 @@ async function groupTab(tab, title, color) {
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
+      await identityReady;
       await refreshProfileLabel();
       return {
         extensionId: chrome.runtime.id,
+        clientId: await ensureClientId(),
         extensionVersion: chrome.runtime.getManifest().version,
         bridgeUrl: BRIDGE_URL,
         profileLabel,
