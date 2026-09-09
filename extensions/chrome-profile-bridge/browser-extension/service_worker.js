@@ -1,26 +1,26 @@
-const DEFAULT_BRIDGE_PORT = 17318;
-const BRIDGE_HOST = "127.0.0.1";
-const BRIDGE_PORT_STORAGE_KEY = "bridgePort";
-let bridgeUrl = `http://${BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}`;
-let bridgeReady = loadBridgeUrl();
-const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
+const BRIDGE_URL = "http://127.0.0.1:17318";
+const CLIENT_ID = chrome.runtime.id;
+const CLIENT_NAME = `Pi Chrome Connector ${CLIENT_ID}`;
+let profileLabel = CLIENT_ID.slice(0, 8);
 
-async function loadBridgeUrl() {
+async function refreshProfileLabel() {
+  // Best-effort human label: active Google account email, else short extension id.
   try {
-    const stored = await chrome.storage.local.get(BRIDGE_PORT_STORAGE_KEY);
-    const port = Number(stored[BRIDGE_PORT_STORAGE_KEY]);
-    const safe = Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_BRIDGE_PORT;
-    bridgeUrl = `http://${BRIDGE_HOST}:${safe}`;
-  } catch {
-    bridgeUrl = `http://${BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}`;
-  }
+    if (chrome.identity?.getProfileUserInfo) {
+      const info = await chrome.identity.getProfileUserInfo({ accountStatus: "ANY" });
+      if (info?.email) { profileLabel = info.email; return; }
+    }
+  } catch {}
+  try {
+    const stored = await chrome.storage.local.get("profileLabel");
+    if (typeof stored.profileLabel === "string" && stored.profileLabel.trim()) {
+      profileLabel = stored.profileLabel.trim();
+      return;
+    }
+  } catch {}
+  profileLabel = CLIENT_ID.slice(0, 8);
 }
 
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes[BRIDGE_PORT_STORAGE_KEY]) {
-    bridgeReady = loadBridgeUrl();
-  }
-});
 const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
@@ -997,6 +997,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.action.setBadgeText({ text: "pi" });
   chrome.action.setBadgeBackgroundColor({ color: "#4f46e5" });
   armKeepaliveAlarm();
+  void refreshProfileLabel();
   void pollLoop();
 });
 
@@ -1024,9 +1025,14 @@ async function pollLoop() {
   if (polling) return;
   polling = true;
   try {
-    await bridgeReady;
+    await refreshProfileLabel();
     while (true) {
-      const response = await fetch(`${bridgeUrl}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
+      const qs = new URLSearchParams({
+        name: CLIENT_NAME,
+        clientId: CLIENT_ID,
+        profileLabel,
+      });
+      const response = await fetch(`${BRIDGE_URL}/next?${qs}`, {
         cache: "no-store",
       });
       if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
@@ -1062,7 +1068,7 @@ async function handleCommand(command) {
 }
 
 async function postResult(result) {
-  await fetch(`${bridgeUrl}/result`, {
+  await fetch(`${BRIDGE_URL}/result`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(result),
@@ -1145,10 +1151,12 @@ async function groupTab(tab, title, color) {
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
+      await refreshProfileLabel();
       return {
         extensionId: chrome.runtime.id,
         extensionVersion: chrome.runtime.getManifest().version,
-        bridgeUrl,
+        bridgeUrl: BRIDGE_URL,
+        profileLabel,
         userAgent: navigator.userAgent,
       };
     case "tab.list": {

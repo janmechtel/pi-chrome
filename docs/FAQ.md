@@ -34,7 +34,8 @@ Yes. The first session opens the local bridge; later sessions detect it and pipe
 
 ## Can I bind it to a particular Chrome profile?
 
-Yes. Load the unpacked extension only in that profile (Chrome isolates extensions per profile). For two profiles at once, give each its own bridge port: set `PI_CHROME_BRIDGE_PORT` for the Pi session, and set the same port in that profile's extension popup.
+Yes. Load Pi Chrome Connector in that profile (and any others you might use). Then run `/chrome authorize` — it lists connected profiles and authorizes indefinitely for the one you pick. Optional: `/chrome authorize kontext21` to match by label.
+
 
 ## Does pi-chrome navigate my current tab?
 

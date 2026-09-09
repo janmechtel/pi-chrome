@@ -30,12 +30,22 @@ type BridgeCommand = {
 	params: Record<string, unknown>;
 };
 
+type ExtensionClient = {
+	clientId: string;
+	profileLabel: string;
+	name?: string;
+	lastSeenAt: number;
+	queue: BridgeCommand[];
+	waiters: Array<(command: BridgeCommand | undefined) => void>;
+};
+
 type PendingCommand = {
 	command: BridgeCommand;
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
 	deliveredAt?: number;
+	clientId?: string;
 };
 
 type BridgeResult = {
@@ -299,10 +309,7 @@ function sendJson(response: ServerResponse, status: number, body: unknown, extra
 class ChromeProfileBridge {
 	private server: Server | undefined;
 	private pending = new Map<string, PendingCommand>();
-	private queue: BridgeCommand[] = [];
-	private waiters: Array<(command: BridgeCommand | undefined) => void> = [];
-	private lastSeenAt: number | undefined;
-	private clientName: string | undefined;
+	private clients = new Map<string, ExtensionClient>();
 	private mode: "server" | "client" | undefined;
 
 	constructor(
@@ -315,20 +322,71 @@ class ChromeProfileBridge {
 	}
 
 	get connected(): boolean {
-		// MV3 service workers can pause between polls/alarms. Treat a recent poll as
-		// connected without sending a probe command; real chrome_* tool calls are
-		// the authoritative end-to-end health check.
-		return this.lastSeenAt !== undefined && Date.now() - this.lastSeenAt < 5 * 60_000;
+		return this.listClients().length > 0;
+	}
+
+	listClients(maxAgeMs = 5 * 60_000): Array<{ clientId: string; profileLabel: string; lastSeenAt: number; name?: string }> {
+		const now = Date.now();
+		const out: Array<{ clientId: string; profileLabel: string; lastSeenAt: number; name?: string }> = [];
+		for (const [clientId, client] of this.clients) {
+			if (now - client.lastSeenAt > maxAgeMs) {
+				this.dropClient(clientId, "Chrome profile disconnected");
+				continue;
+			}
+			out.push({
+				clientId,
+				profileLabel: client.profileLabel,
+				lastSeenAt: client.lastSeenAt,
+				name: client.name,
+			});
+		}
+		return out.sort((a, b) => a.profileLabel.localeCompare(b.profileLabel));
+	}
+
+	private touchClient(clientId: string, profileLabel?: string | null, name?: string | null): ExtensionClient {
+		const existing = this.clients.get(clientId);
+		if (existing) {
+			existing.lastSeenAt = Date.now();
+			if (profileLabel) existing.profileLabel = profileLabel;
+			if (name) existing.name = name;
+			return existing;
+		}
+		const created: ExtensionClient = {
+			clientId,
+			profileLabel: profileLabel || clientId.slice(0, 8),
+			name: name || undefined,
+			lastSeenAt: Date.now(),
+			queue: [],
+			waiters: [],
+		};
+		this.clients.set(clientId, created);
+		return created;
+	}
+
+	private dropClient(clientId: string, reason: string): void {
+		const client = this.clients.get(clientId);
+		if (!client) return;
+		this.clients.delete(clientId);
+		for (const waiter of client.waiters) waiter(undefined);
+		client.waiters = [];
+		for (const command of client.queue) {
+			const pending = this.pending.get(command.id);
+			if (!pending) continue;
+			clearTimeout(pending.timer);
+			this.pending.delete(command.id);
+			pending.reject(new Error(reason));
+		}
+		client.queue = [];
 	}
 
 	status(): Record<string, unknown> {
+		const clients = this.listClients();
 		return {
 			url: this.url,
 			mode: this.mode ?? "starting",
-			connected: this.connected,
-			lastSeenAt: this.lastSeenAt,
-			clientName: this.clientName,
-			queuedCommands: this.queue.length,
+			connected: clients.length > 0,
+			clients,
+			clientCount: clients.length,
 			pendingCommands: this.pending.size,
 		};
 	}
@@ -338,8 +396,6 @@ class ChromeProfileBridge {
 		await this.bindServerOrClient();
 	}
 
-	// Try to own the bridge port. On success we are the server; on EADDRINUSE another Pi
-	// session owns it and we run as a client that forwards commands to that owner.
 	private async bindServerOrClient(): Promise<void> {
 		const server = createServer((request, response) => {
 			void this.handle(request, response).catch((error) => {
@@ -359,15 +415,10 @@ class ChromeProfileBridge {
 		} catch (error) {
 			server.close();
 			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-			// Another Pi session already owns the bridge port. Use it as the shared
-			// machine-local broker so multiple Pi sessions can control Chrome at once.
 			this.mode = "client";
 		}
 	}
 
-	// Client-mode self-heal: when the owning Pi session disappears, fetches to its port fail
-	// with `fetch failed` / ECONNREFUSED forever. Try to grab the now-free port and become the
-	// server ourselves so chrome_* tools recover without a manual restart.
 	private async tryPromoteToServer(): Promise<boolean> {
 		if (this.mode !== "client") return this.mode === "server";
 		this.mode = undefined;
@@ -385,9 +436,7 @@ class ChromeProfileBridge {
 			pending.reject(new Error("Chrome profile bridge stopped"));
 		}
 		this.pending.clear();
-		this.queue = [];
-		for (const waiter of this.waiters) waiter(undefined);
-		this.waiters = [];
+		for (const clientId of [...this.clients.keys()]) this.dropClient(clientId, "Chrome profile bridge stopped");
 		this.server?.close();
 		this.server = undefined;
 		this.mode = undefined;
@@ -398,9 +447,31 @@ class ChromeProfileBridge {
 		return this.sendLocal(action, params, timeoutMs, signal);
 	}
 
+	private resolveClientId(params: Record<string, unknown>): string | undefined {
+		return typeof params.clientId === "string" && params.clientId ? params.clientId : undefined;
+	}
+
 	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
+		const clientId = this.resolveClientId(params);
+		const clients = this.listClients();
+		const targetId = clientId ?? (clients.length === 1 ? clients[0].clientId : undefined);
+		if (!targetId) {
+			return Promise.reject(
+				new Error(
+					clients.length === 0
+						? "No Chrome profile is connected. Load Pi Chrome Connector in the profile you want, then run /chrome authorize."
+						: "Multiple Chrome profiles are connected. Run /chrome authorize and pick one.",
+				),
+			);
+		}
+		const client = this.clients.get(targetId);
+		if (!client) {
+			return Promise.reject(new Error(`Chrome profile ${targetId} is not connected. Run /chrome authorize.`));
+		}
+
+		const { clientId: _drop, ...extParams } = params;
 		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-		const command = { id, action, params };
+		const command = { id, action, params: extParams };
 		return new Promise((resolveCommand, rejectCommand) => {
 			if (signal?.aborted) {
 				rejectCommand(new Error("Chrome command aborted"));
@@ -412,41 +483,39 @@ class ChromeProfileBridge {
 			const onAbort = () => {
 				clearTimeout(timer);
 				this.pending.delete(id);
-				this.queue = this.queue.filter((queued) => queued.id !== id);
+				client.queue = client.queue.filter((queued) => queued.id !== id);
 				cleanupAbort();
 				rejectCommand(new Error("Chrome command aborted"));
 			};
 			const timer = setTimeout(() => {
 				const entry = this.pending.get(id);
 				this.pending.delete(id);
-				this.queue = this.queue.filter((queued) => queued.id !== id);
+				client.queue = client.queue.filter((queued) => queued.id !== id);
 				cleanupAbort();
-				rejectCommand(new Error(this.timeoutMessage(entry, timeoutMs)));
+				rejectCommand(new Error(this.timeoutMessage(entry, timeoutMs, client)));
 			}, timeoutMs);
 			this.pending.set(id, {
 				command,
 				resolve: (value) => { cleanupAbort(); resolveCommand(value); },
 				reject: (err) => { cleanupAbort(); rejectCommand(err); },
 				timer,
+				clientId: targetId,
 			});
 			if (signal) signal.addEventListener("abort", onAbort, { once: true });
-			this.enqueue(command);
+			this.enqueue(client, command);
 		});
 	}
 
-	// Classify why a local command timed out so the agent isn't left guessing. The three
-	// distinct failure modes are: extension never polled (not installed / not running),
-	// extension polled but never picked up this command, and extension picked up the command
-	// but never posted a result back (long-running action or a failed /result post).
-	private timeoutMessage(entry: PendingCommand | undefined, timeoutMs: number): string {
-		const pollAgeMs = this.lastSeenAt === undefined ? undefined : Date.now() - this.lastSeenAt;
+	private timeoutMessage(entry: PendingCommand | undefined, timeoutMs: number, client: ExtensionClient): string {
+		const pollAgeMs = Date.now() - client.lastSeenAt;
+		const label = client.profileLabel;
 		if (entry?.deliveredAt) {
-			return `Timed out after ${timeoutMs}ms: the Chrome extension received the command but never returned a result. The action may be long-running, or the result post failed. Run /chrome doctor; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
+			return `Timed out after ${timeoutMs}ms: Chrome profile "${label}" received the command but never returned a result. Reload 'Pi Chrome Connector' in that profile.`;
 		}
-		if (pollAgeMs === undefined || pollAgeMs > 60_000) {
-			return `Timed out after ${timeoutMs}ms: the Chrome extension is not polling (last seen ${pollAgeMs === undefined ? "never" : Math.round(pollAgeMs / 1000) + "s ago"}). Run /chrome onboard, then load the bundled browser-extension folder in your normal Chrome profile and keep that Chrome window open.`;
+		if (pollAgeMs > 60_000) {
+			return `Timed out after ${timeoutMs}ms: Chrome profile "${label}" is not polling (last seen ${Math.round(pollAgeMs / 1000)}s ago). Keep that Chrome profile open.`;
 		}
-		return `Timed out after ${timeoutMs}ms: the Chrome extension is polling (last seen ${Math.round(pollAgeMs / 1000)}s ago) but did not pick up this command in time. Retry; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
+		return `Timed out after ${timeoutMs}ms: Chrome profile "${label}" is polling but did not pick up this command in time. Retry or reload the extension.`;
 	}
 
 	private async sendViaOwner(action: string, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
@@ -477,9 +546,6 @@ class ChromeProfileBridge {
 				if (signal?.aborted) throw new Error("Chrome command aborted");
 				throw new Error(`Timed out waiting for shared Chrome bridge owner after ${timeoutMs}ms`);
 			}
-			// `fetch failed` / ECONNREFUSED means the Pi session that owned the bridge port is gone.
-			// Try to take over the port ourselves and re-run the command locally instead of staying
-			// stuck as a client pointed at a dead owner.
 			if (this.isOwnerUnreachable(error)) {
 				const promoted = await this.tryPromoteToServer().catch(() => false);
 				if (promoted) return this.sendLocal(action, params, timeoutMs, signal);
@@ -507,10 +573,10 @@ class ChromeProfileBridge {
 		);
 	}
 
-	private enqueue(command: BridgeCommand): void {
-		const waiter = this.waiters.shift();
+	private enqueue(client: ExtensionClient, command: BridgeCommand): void {
+		const waiter = client.waiters.shift();
 		if (waiter) waiter(command);
-		else this.queue.push(command);
+		else client.queue.push(command);
 	}
 
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -555,33 +621,30 @@ class ChromeProfileBridge {
 				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
 				return;
 			}
-			this.lastSeenAt = Date.now();
-			this.clientName = url.searchParams.get("name") ?? undefined;
+			const clientId = url.searchParams.get("clientId") || url.searchParams.get("name") || "unknown";
+			const profileLabel = url.searchParams.get("profileLabel");
+			const name = url.searchParams.get("name");
+			const client = this.touchClient(clientId, profileLabel, name);
 			let aborted = false;
 			let activeWaiter: ((command: BridgeCommand | undefined) => void) | undefined;
 			request.once("close", () => {
 				aborted = true;
-				if (activeWaiter) this.waiters = this.waiters.filter((entry) => entry !== activeWaiter);
+				if (activeWaiter) client.waiters = client.waiters.filter((entry) => entry !== activeWaiter);
 			});
-			let command = this.queue.shift();
+			let command = client.queue.shift();
 			if (!command) {
-				command = await this.waitForCommand(25_000, (waiter) => {
+				command = await this.waitForCommand(client, 25_000, (waiter) => {
 					activeWaiter = waiter;
 				});
 			}
 			if (aborted) {
-				// Long-poll connection died before we could deliver. Requeue any command we pulled
-				// so the next live /next picks it up instead of dropping it on the floor.
-				if (command) this.queue.unshift(command);
+				if (command) client.queue.unshift(command);
 				return;
 			}
-			// Mark the command as delivered so a later timeout can distinguish "extension never
-			// picked it up" from "extension is running it / failed to post a result".
 			if (command) {
 				const entry = this.pending.get(command.id);
 				if (entry) entry.deliveredAt = Date.now();
 			}
-			// Re-read version on every /next so bumping package.json takes effect without pi restart.
 			const currentVersion = readPiChromeVersion();
 			sendJson(
 				response,
@@ -598,13 +661,13 @@ class ChromeProfileBridge {
 				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
 				return;
 			}
-			this.lastSeenAt = Date.now();
 			const result = JSON.parse(await readRequestBody(request)) as BridgeResult;
 			const pending = this.pending.get(result.id);
 			if (!pending) {
 				sendJson(response, 404, { ok: false, error: "unknown command id" }, corsHeaders);
 				return;
 			}
+			if (pending.clientId) this.touchClient(pending.clientId);
 			clearTimeout(pending.timer);
 			this.pending.delete(result.id);
 			if (result.ok) pending.resolve(result.result);
@@ -616,6 +679,7 @@ class ChromeProfileBridge {
 	}
 
 	private waitForCommand(
+		client: ExtensionClient,
 		timeoutMs: number,
 		registerWaiter?: (waiter: (command: BridgeCommand | undefined) => void) => void,
 	): Promise<BridgeCommand | undefined> {
@@ -625,16 +689,15 @@ class ChromeProfileBridge {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
-				this.waiters = this.waiters.filter((entry) => entry !== waiter);
+				client.waiters = client.waiters.filter((entry) => entry !== waiter);
 				resolveWait(command);
 			};
 			const timer = setTimeout(() => waiter(undefined), timeoutMs);
-			this.waiters.push(waiter);
+			client.waiters.push(waiter);
 			registerWaiter?.(waiter);
 		});
 	}
 }
-
 const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
@@ -670,7 +733,7 @@ export default function (pi: ExtensionAPI): void {
 	const currentRoot = extensionRoot();
 	const globalState = globalThis as typeof globalThis & {
 		[PI_CHROME_GLOBAL_KEY]?: { version: string; root: string; token?: symbol };
-		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite" };
+		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite"; clientId?: string; profileLabel?: string };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
 	if (alreadyLoaded?.token || (alreadyLoaded && alreadyLoaded.root !== currentRoot)) {
@@ -687,18 +750,26 @@ export default function (pi: ExtensionAPI): void {
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = true;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
+	let selectedClientId: string | undefined;
+	let selectedProfileLabel: string | undefined;
 	// Restore an authorization that survived a /reload. Drop it if it already expired.
 	const persistedAuth = globalState[PI_CHROME_AUTH_KEY];
 	if (persistedAuth) {
 		if (persistedAuth.until === "indefinite" || persistedAuth.until > Date.now()) {
 			chromeAuthorizedUntil = persistedAuth.until;
+			selectedClientId = persistedAuth.clientId;
+			selectedProfileLabel = persistedAuth.profileLabel;
 		} else {
 			delete globalState[PI_CHROME_AUTH_KEY];
 		}
 	}
 	const persistAuth = (): void => {
 		if (chromeAuthorizedUntil === undefined) delete globalState[PI_CHROME_AUTH_KEY];
-		else globalState[PI_CHROME_AUTH_KEY] = { until: chromeAuthorizedUntil };
+		else globalState[PI_CHROME_AUTH_KEY] = {
+			until: chromeAuthorizedUntil,
+			...(selectedClientId ? { clientId: selectedClientId } : {}),
+			...(selectedProfileLabel ? { profileLabel: selectedProfileLabel } : {}),
+		};
 	};
 	let chromeToolsRegistered = false;
 	let chromeToolsUsable = false;
@@ -776,16 +847,19 @@ export default function (pi: ExtensionAPI): void {
 		chromeToolsUsable = false;
 		if (logAction && wasUsable) logChromeToolChange(logAction, { authorizedUntil: undefined });
 		chromeAuthorizedUntil = undefined;
+		selectedClientId = undefined;
+		selectedProfileLabel = undefined;
 		persistAuth();
 		// Revoking control ends pi-chrome's automation for this session; tidy up the target we own.
 		cleanupAutomationTargetBestEffort();
 	};
 
-	const authSummary = (): string => {
-		if (chromeAuthorizedUntil === "indefinite") return "authorized indefinitely";
+		const authSummary = (): string => {
+		const profile = selectedProfileLabel ? ` → ${selectedProfileLabel}` : "";
+		if (chromeAuthorizedUntil === "indefinite") return `authorized indefinitely${profile}`;
 		if (typeof chromeAuthorizedUntil === "number") {
 			const remainingMs = chromeAuthorizedUntil - Date.now();
-			if (remainingMs > 0) return `authorized for ~${Math.ceil(remainingMs / 60_000)}m`;
+			if (remainingMs > 0) return `authorized for ~${Math.ceil(remainingMs / 60_000)}m${profile}`;
 		}
 		return "locked";
 	};
@@ -871,12 +945,16 @@ export default function (pi: ExtensionAPI): void {
 
 	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
 		requireChromeControlAuthorized();
+		if (!selectedClientId) {
+			throw new Error("No Chrome profile selected. Run /chrome authorize and pick a connected profile.");
+		}
 		// Scope the service worker's dedicated automation tab/window to this session. Forwarded on
 		// every action so tab resolution, navigation, and cleanup all agree on which target is ours.
 		const sessionKey = sessionKeyFor(sessionCtx);
 		let wireParams: Record<string, unknown> = sessionKey !== undefined && params.sessionKey === undefined
 			? { ...params, sessionKey }
 			: params;
+		if (wireParams.clientId === undefined) wireParams = { ...wireParams, clientId: selectedClientId };
 		const sessionTitle = sessionCtx !== undefined ? sessionGroupTitle(sessionCtx) : undefined;
 		// Any tab Pi opens through tab.new/tab.group must use THIS session's group, even if a caller
 		// passes group:false or a custom groupTitle. This central guard covers chrome_tab plus internal
@@ -981,62 +1059,75 @@ Usage rules:
 			const status = bridge.status();
 			const roleLabel = status.mode === "client" ? "sharing another pi session's connection" : "running the Chrome connection for this machine";
 			lines.push(`• This pi session is ${roleLabel}.`);
+			const clients = bridge.listClients();
+			if (clients.length === 0) {
+				lines.push("✗ No Chrome profile is polling the bridge.");
+				lines.push("  Fix: run /chrome onboard, load the extension in the profile you want, keep that Chrome window open.");
+			} else {
+				lines.push(`✓ Connected profiles (${clients.length}): ${clients.map((c) => c.profileLabel).join(", ")}`);
+				if (selectedProfileLabel) lines.push(`• Authorized profile: ${selectedProfileLabel}`);
+			}
 			let extensionAlive = false;
 			let versionMismatch = false;
-			try {
-				const started = Date.now();
-				const version = (await bridge.send("tab.version", {}, 35_000)) as {
-					extensionId?: string;
-					extensionVersion?: string;
-					bridgeUrl?: string;
-				};
-				const latencyMs = Date.now() - started;
-				extensionAlive = true;
-				if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
-					versionMismatch = true;
-					lines.push(
-						`✗ The Chrome companion extension is on an old version (${version.extensionVersion}); this pi-chrome is ${PI_CHROME_VERSION}.`,
-						`  Every Chrome action will run with the old code until you reload the extension.`,
-						`  Fix: open chrome://extensions and click the refresh icon on 'Pi Chrome Connector'.`,
-						`  (After this one-time fix, future updates reload automatically.)`,
-					);
-				} else {
-					lines.push(`✓ Chrome is connected (companion extension v${version.extensionVersion ?? "?"}, responded in ${latencyMs}ms).`);
-				}
-			} catch (error) {
-				const message = (error as Error).message;
-				lines.push(`✗ Chrome isn't responding: ${message}`);
-				if (message.includes("older pi-chrome without multi-session")) {
-					lines.push("  Fix: quit and restart the pi session that first opened the Chrome connection (it was on an older pi-chrome).");
-				} else {
-					lines.push("  Fix: run /chrome onboard to install the Chrome companion extension, then keep that Chrome window open.");
+			for (const client of clients) {
+				try {
+					const started = Date.now();
+					const version = (await bridge.send("tab.version", { clientId: client.clientId }, 35_000)) as {
+						extensionId?: string;
+						extensionVersion?: string;
+						profileLabel?: string;
+					};
+					const latencyMs = Date.now() - started;
+					extensionAlive = true;
+					if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
+						versionMismatch = true;
+						lines.push(
+							`✗ Profile "${client.profileLabel}" extension v${version.extensionVersion} (pi-chrome ${PI_CHROME_VERSION}). Reload it at chrome://extensions.`,
+						);
+					} else {
+						lines.push(`✓ Profile "${client.profileLabel}" ok (${latencyMs}ms).`);
+					}
+				} catch (error) {
+					lines.push(`✗ Profile "${client.profileLabel}" not responding: ${(error as Error).message}`);
 				}
 			}
 
-			if (extensionAlive && !versionMismatch) {
-				// Sanity-check that pi-chrome can actually run code in the active tab.
+			if (extensionAlive && !versionMismatch && clients.length > 0) {
+				const probeClientId = selectedClientId ?? clients[0].clientId;
+				const probeLabel = selectedProfileLabel ?? clients[0].profileLabel;
 				try {
-					const value = await bridge.send("page.evaluate", { expression: "1+1", awaitPromise: true, foreground: false }, 10_000);
-					if (value === 2) lines.push(`✓ pi-chrome can run code in the active Chrome tab.`);
-					else lines.push(`⚠ pi-chrome ran code in the active tab but got an unexpected result (${JSON.stringify(value)}). The current tab may be locked-down (a Chrome internal page or a strict site).`);
+					const value = await bridge.send(
+						"page.evaluate",
+						{ expression: "1+1", awaitPromise: true, foreground: false, clientId: probeClientId },
+						10_000,
+					);
+					if (value === 2) lines.push(`✓ page.evaluate smoke test passed on "${probeLabel}".`);
+					else lines.push(`⚠ page.evaluate on "${probeLabel}" returned ${JSON.stringify(value)} (expected 2).`);
 				} catch (error) {
-					lines.push(`✗ pi-chrome can't run code in the active tab: ${(error as Error).message}`);
+					lines.push(`⚠ page.evaluate smoke test failed on "${probeLabel}": ${(error as Error).message}`);
 				}
-
-				// Surface obvious site-side automation flags so the user knows why a site might block pi.
 				try {
-					const probe = (await bridge.send("page.probe", { foreground: false }, 10_000)) as Record<string, unknown>;
-					if (probe && probe.arithmetic === 2) lines.push(`✓ The active tab is ${hostnameOf(String(probe.location))} and accepts pi-chrome's commands.`);
-					if (probe && probe.webdriver) lines.push(`⚠ Your Chrome is reporting itself as automated to websites. Some sites use this signal to block sign-ins or bot checks.`);
+					const probe = (await bridge.send("page.probe", { foreground: false, clientId: probeClientId }, 10_000)) as Record<string, unknown>;
+					if (probe && probe.arithmetic === 2) {
+						const loc = typeof probe.location === "string" ? probe.location : "";
+						let host = loc;
+						try { host = new URL(loc).hostname; } catch {}
+						lines.push(`✓ Active tab on "${probeLabel}" is ${host || "unknown"} and accepts commands.`);
+					}
+					if (probe && probe.webdriver) {
+						lines.push(`⚠ Chrome reports itself as automated to websites. Some sites use this to block sign-ins.`);
+					}
 				} catch (error) {
-					lines.push(`⚠ Couldn't inspect the active tab: ${(error as Error).message}`);
+					lines.push(`⚠ Couldn't inspect the active tab on "${probeLabel}": ${(error as Error).message}`);
 				}
 			} else if (versionMismatch) {
 				lines.push(`… Skipped the remaining checks until you reload the Chrome extension.`);
 			}
 
-		ctx.ui.notify(lines.join("\n"), "info");
-	};
+			lines.push(`• Auth: ${authSummary()}`);
+			lines.push(`• Background: ${backgroundDefault ? "on" : "off"}`);
+			ctx.ui.notify(lines.join("\n"), "info");
+		};
 
 	// Run-in-background (Chrome focus) handler. No args = toggle. Explicit on/off/status.
 	const BACKGROUND_DESC: Record<string, string> = {
@@ -1065,41 +1156,73 @@ Usage rules:
 		ctx.ui.notify(`Run in background → ${nextLabel}. ${BACKGROUND_DESC[nextLabel]}`, "info");
 	};
 
-	const authorizeFor = async (ctx: ExtensionContext, label: string, until: number | "indefinite") => {
+	const authorizeFor = async (ctx: ExtensionContext, clientId: string, profileLabel: string) => {
 		const ok = await ctx.ui.confirm(
 			"Authorize pi-chrome control?",
-			`This Pi session will be allowed to inspect and control your existing Chrome profile for ${label}.\n\nChrome actions use your signed-in browser state and real input. Only approve if you trust the current agent/task.`,
+			`This Pi session will control Chrome profile "${profileLabel}" indefinitely (until /chrome revoke or Pi exits).\n\nChrome actions use that profile's signed-in state and real input. Only approve if you trust the current agent/task.`,
 		);
 		if (!ok) {
 			ctx.ui.notify("Chrome control remains locked.", "info");
 			return;
 		}
 		const wasUsable = chromeToolsUsable;
-		chromeAuthorizedUntil = until;
+		selectedClientId = clientId;
+		selectedProfileLabel = profileLabel;
+		chromeAuthorizedUntil = "indefinite";
 		persistAuth();
 		activateChromeTools();
 		chromeToolsUsable = true;
-		logChromeToolChange(wasUsable ? "reauthorized" : "authorized", { label, authorizedUntil: until });
-		scheduleAuthExpiry(ctx, until);
-		ctx.ui.notify(`Chrome control authorized for ${label}.`, "info");
+		logChromeToolChange(wasUsable ? "reauthorized" : "authorized", {
+			label: profileLabel,
+			authorizedUntil: "indefinite",
+		});
+		scheduleAuthExpiry(ctx, "indefinite");
+		ctx.ui.notify(`Chrome control authorized indefinitely for ${profileLabel}.`, "info");
 		updateChromeStatus(ctx);
 	};
 
-	const parseAuthorizeArg = (arg: string): { label: string; until: number | "indefinite" } | undefined => {
-		const normalized = arg.trim().toLowerCase() || "15m";
-		if (normalized === "indefinite" || normalized === "forever") return { label: "indefinitely", until: "indefinite" };
-		const minutes = normalized.endsWith("m") ? Number(normalized.slice(0, -1)) : Number(normalized);
-		if (!Number.isFinite(minutes) || minutes <= 0) return undefined;
-		return { label: `${minutes} minutes`, until: Date.now() + minutes * 60_000 };
+	const pickConnectedProfile = async (ctx: ExtensionContext, preferred?: string): Promise<{ clientId: string; profileLabel: string } | undefined> => {
+		// Give extensions a moment to poll after Pi starts.
+		let clients = bridge.listClients();
+		if (clients.length === 0) {
+			await new Promise((r) => setTimeout(r, 1500));
+			clients = bridge.listClients();
+		}
+		if (clients.length === 0) {
+			ctx.ui.notify(
+				"No Chrome profile is connected. Load Pi Chrome Connector in the profile you want (chrome://extensions → Load unpacked), keep that window open, then run /chrome authorize again.",
+				"warning",
+			);
+			return undefined;
+		}
+		if (preferred) {
+			const pref = preferred.trim().toLowerCase();
+			const hit = clients.find(
+				(c) =>
+					c.profileLabel.toLowerCase() === pref ||
+					c.clientId.toLowerCase() === pref ||
+					c.profileLabel.toLowerCase().includes(pref),
+			);
+			if (hit) return { clientId: hit.clientId, profileLabel: hit.profileLabel };
+			ctx.ui.notify(`No connected profile matches '${preferred}'. Connected: ${clients.map((c) => c.profileLabel).join(", ")}`, "warning");
+			return undefined;
+		}
+		const labels = clients.map((c) => c.profileLabel);
+		const choice = await ctx.ui.select("Authorize which Chrome profile? (indefinite)", labels);
+		if (!choice) return undefined;
+		const idx = labels.indexOf(choice);
+		const picked = idx >= 0 ? clients[idx] : undefined;
+		if (!picked) return undefined;
+		return { clientId: picked.clientId, profileLabel: picked.profileLabel };
 	};
 
 	const authorizeHandler = async (ctx: ExtensionContext, args: string) => {
-		const grant = parseAuthorizeArg(args);
-		if (!grant) {
-			ctx.ui.notify("Unknown authorize duration. Use minutes (15m, 30m, 45) or indefinite.", "warning");
-			return;
-		}
-		return authorizeFor(ctx, grant.label, grant.until);
+		const preferred = (args || "").trim();
+		// Ignore legacy duration tokens; authorize is always indefinite now.
+		const legacyDuration = /^(?:\d+m?|indefinite|forever)$/i.test(preferred);
+		const profile = await pickConnectedProfile(ctx, legacyDuration ? undefined : preferred || undefined);
+		if (!profile) return;
+		return authorizeFor(ctx, profile.clientId, profile.profileLabel);
 	};
 
 	const revokeHandler = (ctx: ExtensionContext) => {
@@ -1133,15 +1256,11 @@ Usage rules:
 	// picker and as the body of /chrome status.
 	const statusSummary = async (): Promise<string> => {
 		const parts: string[] = [];
-		try {
-			const version = (await bridge.send("tab.version", {}, 5_000)) as { extensionVersion?: string };
-			if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
-				parts.push(`⚠ Chrome extension v${version.extensionVersion} (pi-chrome v${PI_CHROME_VERSION}, reload extension)`);
-			} else {
-				parts.push(`✓ Chrome connected`);
-			}
-		} catch {
-			parts.push(`✗ Chrome not responding`);
+		const clients = bridge.listClients();
+		if (clients.length === 0) {
+			parts.push(`✗ no Chrome profile connected`);
+		} else {
+			parts.push(`✓ ${clients.length} profile${clients.length === 1 ? "" : "s"}: ${clients.map((c) => c.profileLabel).join(", ")}`);
 		}
 		parts.push(`auth: ${authSummary()}`);
 		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);
@@ -1154,25 +1273,7 @@ Usage rules:
 	};
 
 	const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
-		while (true) {
-			const choice = await ctx.ui.select("Authorize Chrome control", [
-				"15 minutes",
-				"30 minutes",
-				"Indefinite",
-				"Custom minutes",
-			]);
-			if (!choice) return;
-			switch (choice) {
-				case "15 minutes": return authorizeHandler(ctx, "15m");
-				case "30 minutes": return authorizeHandler(ctx, "30m");
-				case "Indefinite": return authorizeHandler(ctx, "indefinite");
-				case "Custom minutes": {
-					const value = await ctx.ui.input("Authorize for how many minutes?", "45");
-					if (!value) continue;
-					return authorizeHandler(ctx, value);
-				}
-			}
-		}
+		return authorizeHandler(ctx, "");
 	};
 
 	const openBackgroundMenu = async (ctx: ExtensionContext): Promise<void> => {
@@ -1210,7 +1311,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [profile] — pick a connected Chrome profile and authorize indefinitely.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1235,11 +1336,14 @@ Usage rules:
 					{ fullValue: "background", label: "background", description: "Run pi-chrome in the background without focusing Chrome?" },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
-				candidates = [
-					{ fullValue: "authorize 15m", label: "15m", description: "Authorize Chrome control for 15 minutes." },
-					{ fullValue: "authorize 30m", label: "30m", description: "Authorize Chrome control for 30 minutes." },
-					{ fullValue: "authorize indefinite", label: "indefinite", description: "Authorize Chrome control until revoked or Pi exits." },
-				];
+				const clients = bridge.listClients();
+				candidates = clients.length
+					? clients.map((c) => ({
+							fullValue: `authorize ${c.profileLabel}`,
+							label: c.profileLabel,
+							description: `Authorize indefinitely for this connected profile (${c.clientId.slice(0, 8)}…).`,
+					  }))
+					: [{ fullValue: "authorize", label: "(none connected)", description: "Load Pi Chrome Connector in a Chrome profile first." }];
 			} else if (path[0] === "background" && path.length === 1) {
 				candidates = [
 					{ fullValue: "background on", label: "on", description: "Run in background. Chrome stays in the background. Your editor keeps focus. (default)" },
@@ -1293,7 +1397,7 @@ Usage rules:
 			"Start/check the local bridge used by the companion Chrome extension. This does not launch a separate Chrome profile; install the unpacked Chrome extension in your existing Chrome profile to connect.",
 		promptSnippet: "Show instructions for connecting Pi to the user's existing Chrome profile via the companion extension.",
 		parameters: Type.Object({
-			port: Type.Optional(Type.Number({ description: "Ignored here. Set PI_CHROME_BRIDGE_PORT for the Pi process and the same port in the Chrome extension popup (per profile). Default 17318." })),
+			port: Type.Optional(Type.Number({ description: "Ignored. Pick the Chrome profile with /chrome authorize; all profiles share 127.0.0.1:17318." })),
 			url: Type.Optional(Type.String({ description: "Optional URL to open in the existing Chrome profile after the extension is connected." })),
 			userDataDir: Type.Optional(Type.String({ description: "Ignored. This bridge intentionally uses the user's existing Chrome profile through the companion extension." })),
 			useDefaultProfile: Type.Optional(Type.Boolean({ description: "Ignored; existing-profile access comes from the companion Chrome extension." })),

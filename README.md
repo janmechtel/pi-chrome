@@ -2,7 +2,7 @@
 
 > Let [Pi](https://pi.dev) use your existing signed-in Chrome profile after explicit authorization.
 
-**MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318` default; override with `PI_CHROME_BRIDGE_PORT` + extension popup) · inspectable unpacked Chrome extension.** Review [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading. Verify setup with `/chrome doctor`.
+**MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318`) · multi-profile via `/chrome authorize` · inspectable unpacked Chrome extension.** Review [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading. Verify setup with `/chrome doctor`.
 
 ```text
 You:    "Find my open GitHub PR tab, summarize review state, and screenshot failing CI."
@@ -81,10 +81,9 @@ Tool parameters and gotchas are documented inline in Pi.
 Chrome control is locked by default. Authorize per Pi session:
 
 ```text
-/chrome authorize          # 15 minutes
-/chrome authorize 30m      # custom duration
-/chrome authorize indefinite
-/chrome revoke             # lock again
+/chrome authorize                 # pick a connected Chrome profile (indefinite)
+/chrome authorize kontext21       # match by profile label
+/chrome revoke                    # lock again
 /chrome status
 ```
 

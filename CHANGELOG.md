@@ -2,6 +2,12 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.48
+
+- **/chrome authorize picks a Chrome profile.** Always indefinite. Lists connected companion-extension instances and asks which profile to drive; optional `/chrome authorize <name>`.
+- **Multi-profile on one bridge.** Multiple Chrome profiles can load the extension against `127.0.0.1:17318`; commands route to the authorized profile's client id.
+- **Removed per-profile port popup** from 0.15.47 — no more manual `PI_CHROME_BRIDGE_PORT` matching.
+
 ## 0.15.47
 
 - **Per-profile bridge port.** Extension popup stores `bridgePort` in `chrome.storage.local` (default 17318). Match Pi with `PI_CHROME_BRIDGE_PORT` to run two Chrome profiles against separate bridges.
