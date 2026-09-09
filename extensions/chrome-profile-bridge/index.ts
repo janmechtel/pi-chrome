@@ -343,6 +343,46 @@ class ChromeProfileBridge {
 		return out.sort((a, b) => a.profileLabel.localeCompare(b.profileLabel));
 	}
 
+	/** Local clients, or (in client mode) whatever the bridge owner reports — including legacy single-client status. */
+	async discoverClients(maxAgeMs = 5 * 60_000): Promise<Array<{ clientId: string; profileLabel: string; lastSeenAt: number; name?: string }>> {
+		const local = this.listClients(maxAgeMs);
+		if (this.mode !== "client") return local;
+		try {
+			const response = await fetch(`${this.url}/status`, { cache: "no-store" });
+			if (!response.ok) return local;
+			const remote = (await response.json()) as {
+				clients?: Array<{ clientId?: string; profileLabel?: string; lastSeenAt?: number; name?: string }>;
+				clientName?: string;
+				lastSeenAt?: number;
+				connected?: boolean;
+			};
+			if (Array.isArray(remote.clients) && remote.clients.length > 0) {
+				return remote.clients
+					.filter((c) => typeof c.clientId === "string" && c.clientId)
+					.map((c) => ({
+						clientId: c.clientId as string,
+						profileLabel: (c.profileLabel || c.clientId) as string,
+						lastSeenAt: typeof c.lastSeenAt === "number" ? c.lastSeenAt : Date.now(),
+						name: c.name,
+					}))
+					.sort((a, b) => a.profileLabel.localeCompare(b.profileLabel));
+			}
+			// Legacy owner (pre-multi-client): one extension name on the status blob.
+			if (remote.connected && typeof remote.clientName === "string" && remote.clientName) {
+				const label = remote.clientName.replace(/^Pi Chrome Connector\s+/i, "") || remote.clientName;
+				return [{
+					clientId: remote.clientName,
+					profileLabel: label,
+					lastSeenAt: typeof remote.lastSeenAt === "number" ? remote.lastSeenAt : Date.now(),
+					name: remote.clientName,
+				}];
+			}
+		} catch {
+			// Owner unreachable — fall through to local (usually empty).
+		}
+		return local;
+	}
+
 	private touchClient(clientId: string, profileLabel?: string | null, name?: string | null): ExtensionClient {
 		const existing = this.clients.get(clientId);
 		if (existing) {
@@ -1059,10 +1099,13 @@ Usage rules:
 			const status = bridge.status();
 			const roleLabel = status.mode === "client" ? "sharing another pi session's connection" : "running the Chrome connection for this machine";
 			lines.push(`• This pi session is ${roleLabel}.`);
-			const clients = bridge.listClients();
+			const clients = await bridge.discoverClients();
 			if (clients.length === 0) {
 				lines.push("✗ No Chrome profile is polling the bridge.");
 				lines.push("  Fix: run /chrome onboard, load the extension in the profile you want, keep that Chrome window open.");
+				if (status.mode === "client") {
+					lines.push("  Note: this Pi session is sharing another session's bridge. /reload or quit that other Pi session so this fork can own :17318.");
+				}
 			} else {
 				lines.push(`✓ Connected profiles (${clients.length}): ${clients.map((c) => c.profileLabel).join(", ")}`);
 				if (selectedProfileLabel) lines.push(`• Authorized profile: ${selectedProfileLabel}`);
@@ -1183,14 +1226,17 @@ Usage rules:
 
 	const pickConnectedProfile = async (ctx: ExtensionContext, preferred?: string): Promise<{ clientId: string; profileLabel: string } | undefined> => {
 		// Give extensions a moment to poll after Pi starts.
-		let clients = bridge.listClients();
+		let clients = await bridge.discoverClients();
 		if (clients.length === 0) {
 			await new Promise((r) => setTimeout(r, 1500));
-			clients = bridge.listClients();
+			clients = await bridge.discoverClients();
 		}
 		if (clients.length === 0) {
+			const shared = bridge.status().mode === "client"
+				? " Another Pi session currently owns the Chrome bridge — /reload or quit that session, then retry."
+				: "";
 			ctx.ui.notify(
-				"No Chrome profile is connected. Load Pi Chrome Connector in the profile you want (chrome://extensions → Load unpacked), keep that window open, then run /chrome authorize again.",
+				"No Chrome profile is connected. Load Pi Chrome Connector in the profile you want (chrome://extensions → Load unpacked), keep that window open, then run /chrome authorize again." + shared,
 				"warning",
 			);
 			return undefined;
@@ -1256,7 +1302,7 @@ Usage rules:
 	// picker and as the body of /chrome status.
 	const statusSummary = async (): Promise<string> => {
 		const parts: string[] = [];
-		const clients = bridge.listClients();
+		const clients = await bridge.discoverClients();
 		if (clients.length === 0) {
 			parts.push(`✗ no Chrome profile connected`);
 		} else {

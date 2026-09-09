@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.49
+
+- **Authorize works when another Pi owns the bridge.** Client-mode sessions discover connected profiles via the owner's `/status` (including legacy single-client owners).
+
 ## 0.15.48
 
 - **/chrome authorize picks a Chrome profile.** Always indefinite. Lists connected companion-extension instances and asks which profile to drive; optional `/chrome authorize <name>`.
