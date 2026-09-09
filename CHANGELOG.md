@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.47
+
+- **Per-profile bridge port.** Extension popup stores `bridgePort` in `chrome.storage.local` (default 17318). Match Pi with `PI_CHROME_BRIDGE_PORT` to run two Chrome profiles against separate bridges.
+
 ## 0.15.40 — 2026-06-22
 
 - **Automation targets reuse the session tab group.** When `chrome_navigate` / implicit page actions create a new pi-chrome automation tab, it is now created in this session's existing tab-group window when possible and joins that same group, avoiding duplicate same-title `Pi Session: ...` groups.

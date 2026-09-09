@@ -1,5 +1,26 @@
-const BRIDGE_URL = "http://127.0.0.1:17318";
+const DEFAULT_BRIDGE_PORT = 17318;
+const BRIDGE_HOST = "127.0.0.1";
+const BRIDGE_PORT_STORAGE_KEY = "bridgePort";
+let bridgeUrl = `http://${BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}`;
+let bridgeReady = loadBridgeUrl();
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
+
+async function loadBridgeUrl() {
+  try {
+    const stored = await chrome.storage.local.get(BRIDGE_PORT_STORAGE_KEY);
+    const port = Number(stored[BRIDGE_PORT_STORAGE_KEY]);
+    const safe = Number.isInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_BRIDGE_PORT;
+    bridgeUrl = `http://${BRIDGE_HOST}:${safe}`;
+  } catch {
+    bridgeUrl = `http://${BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}`;
+  }
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes[BRIDGE_PORT_STORAGE_KEY]) {
+    bridgeReady = loadBridgeUrl();
+  }
+});
 const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
@@ -1003,8 +1024,9 @@ async function pollLoop() {
   if (polling) return;
   polling = true;
   try {
+    await bridgeReady;
     while (true) {
-      const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
+      const response = await fetch(`${bridgeUrl}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
         cache: "no-store",
       });
       if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
@@ -1040,7 +1062,7 @@ async function handleCommand(command) {
 }
 
 async function postResult(result) {
-  await fetch(`${BRIDGE_URL}/result`, {
+  await fetch(`${bridgeUrl}/result`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(result),
@@ -1126,7 +1148,7 @@ async function dispatch(action, params) {
       return {
         extensionId: chrome.runtime.id,
         extensionVersion: chrome.runtime.getManifest().version,
-        bridgeUrl: BRIDGE_URL,
+        bridgeUrl,
         userAgent: navigator.userAgent,
       };
     case "tab.list": {

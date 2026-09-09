@@ -32,6 +32,10 @@ Chrome control is also locked per Pi session until you run `/chrome authorize`; 
 
 Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Each Pi session must be authorized with `/chrome authorize` before its chrome_* tools work. Each session also owns its **own** dedicated automation window (ownership is keyed by session id inside the one extension), so concurrent sessions never navigate into or close each other's tabs.
 
+## Can I bind it to a particular Chrome profile?
+
+Yes. Load the unpacked extension only in that profile (Chrome isolates extensions per profile). For two profiles at once, give each its own bridge port: set `PI_CHROME_BRIDGE_PORT` for the Pi session, and set the same port in that profile's extension popup.
+
 ## Does pi-chrome navigate my current tab?
 
 No. The first chrome_* action that has no explicit target opens a **dedicated automation window** that pi-chrome owns (falling back to a dedicated tab only if a separate window can't be created), and reuses it for the rest of the session. Your existing tabs and windows are never reused or overwritten. Pass `targetId`/`urlIncludes`/`titleIncludes` to deliberately act on a tab you already have open.

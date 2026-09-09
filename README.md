@@ -2,7 +2,7 @@
 
 > Let [Pi](https://pi.dev) use your existing signed-in Chrome profile after explicit authorization.
 
-**MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318`) · inspectable unpacked Chrome extension.** Review [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading. Verify setup with `/chrome doctor`.
+**MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318` default; override with `PI_CHROME_BRIDGE_PORT` + extension popup) · inspectable unpacked Chrome extension.** Review [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading. Verify setup with `/chrome doctor`.
 
 ```text
 You:    "Find my open GitHub PR tab, summarize review state, and screenshot failing CI."

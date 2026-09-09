@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font: 13px system-ui, sans-serif; margin: 12px; min-width: 220px; }
+      label { display: block; margin-bottom: 8px; }
+      input { width: 100%; box-sizing: border-box; margin-top: 4px; }
+      button { width: 100%; margin-top: 4px; }
+      #status { margin: 8px 0 0; color: #555; font-size: 12px; }
+      code { font-size: 11px; }
+    </style>
+  </head>
+  <body>
+    <label>
+      Bridge port
+      <input id="port" type="number" min="1" max="65535" step="1" />
+    </label>
+    <button id="save" type="button">Save</button>
+    <p id="status"></p>
+    <p id="hint" style="margin:8px 0 0;color:#777;font-size:11px">
+      Match Pi with <code>PI_CHROME_BRIDGE_PORT</code>. Default 17318.
+    </p>
+    <script src="popup.js"></script>
+  </body>
+</html>

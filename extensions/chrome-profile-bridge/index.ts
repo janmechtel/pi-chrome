@@ -1293,7 +1293,7 @@ Usage rules:
 			"Start/check the local bridge used by the companion Chrome extension. This does not launch a separate Chrome profile; install the unpacked Chrome extension in your existing Chrome profile to connect.",
 		promptSnippet: "Show instructions for connecting Pi to the user's existing Chrome profile via the companion extension.",
 		parameters: Type.Object({
-			port: Type.Optional(Type.Number({ description: "Ignored. The bundled Chrome extension polls 127.0.0.1:17318." })),
+			port: Type.Optional(Type.Number({ description: "Ignored here. Set PI_CHROME_BRIDGE_PORT for the Pi process and the same port in the Chrome extension popup (per profile). Default 17318." })),
 			url: Type.Optional(Type.String({ description: "Optional URL to open in the existing Chrome profile after the extension is connected." })),
 			userDataDir: Type.Optional(Type.String({ description: "Ignored. This bridge intentionally uses the user's existing Chrome profile through the companion extension." })),
 			useDefaultProfile: Type.Optional(Type.Boolean({ description: "Ignored; existing-profile access comes from the companion Chrome extension." })),

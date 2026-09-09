@@ -29,9 +29,14 @@ The Chrome extension under `extensions/chrome-profile-bridge/browser-extension/`
 - Chrome control locked by default; `/chrome authorize` unlocks current Pi session after terminal confirmation, `/chrome revoke` locks it again.
 - Run-in-background optional; tab/window focus is observable by default (the user can see Pi acting).
 
-## Custom ports
+## Custom ports / multiple Chrome profiles
 
-The bundled Chrome extension currently polls `127.0.0.1:17318`. Custom bridge ports are not supported without editing the extension source and reloading it.
+Default bridge is `127.0.0.1:17318`. For a second Chrome profile:
+
+1. Start Pi with `PI_CHROME_BRIDGE_PORT=17319` (or any free port).
+2. In that profile's extension popup, set the same port and Save.
+
+Each Chrome profile has its own `chrome.storage.local`, so ports do not leak across profiles.
 
 ## Supported versions
 
